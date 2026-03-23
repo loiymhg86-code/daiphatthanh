@@ -1,0 +1,5 @@
+{
+  "name": "Smart School Radio AI",
+  "description": "An intelligent school broadcasting system with AI voice, scheduling, and remote control.",
+  "requestFramePermissions": ["microphone", "bluetooth"]
+}
