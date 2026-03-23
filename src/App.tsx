@@ -40,6 +40,9 @@ import { motion, AnimatePresence } from 'motion/react';
 import { io, Socket } from 'socket.io-client';
 import { generateSpeech } from './services/geminiService';
 import { cn, AudioFile, Schedule, Announcement, SystemSettings, VOICES } from './types';
+import { auth, db, signInWithGoogle, logOut } from './firebase';
+import { collection, doc, setDoc, deleteDoc, onSnapshot, query, orderBy } from 'firebase/firestore';
+import { onAuthStateChanged, User } from 'firebase/auth';
 
 // --- Components ---
 
@@ -118,6 +121,8 @@ const Select = ({ className, children, ...props }: React.SelectHTMLAttributes<HT
 // --- Main App ---
 
 export default function App() {
+  const [user, setUser] = useState<User | null>(null);
+  const [isAuthReady, setIsAuthReady] = useState(false);
   const [activeTab, setActiveTab] = useState<'home' | 'schedule' | 'ai' | 'library' | 'settings'>('home');
   const [currentTime, setCurrentTime] = useState(new Date());
   const [isOnline, setIsOnline] = useState(navigator.onLine);
@@ -171,19 +176,20 @@ export default function App() {
       // Update existing schedule
       const updated = schedules.map(s => {
         if (s.id === editingScheduleId) {
-          return {
+          const updatedSchedule = {
             ...s,
             time: newSchedule.time!,
             label: newSchedule.label!,
             audioId: newSchedule.audioId!,
-            section: parseInt(newSchedule.time!.split(':')[0]) < 12 ? 'morning' : 'afternoon',
+            section: parseInt(newSchedule.time!.split(':')[0]) < 12 ? 'morning' : 'afternoon' as 'morning' | 'afternoon',
             days: newSchedule.days!
           };
+          saveDocToFirestore('schedules', updatedSchedule);
+          return updatedSchedule;
         }
         return s;
       });
       setSchedules(updated);
-      saveToStorage('schedules', updated);
       setEditingScheduleId(null);
       setNewSchedule({
         time: '08:00',
@@ -206,7 +212,7 @@ export default function App() {
       };
       const updated = [...schedules, schedule];
       setSchedules(updated);
-      saveToStorage('schedules', updated);
+      saveDocToFirestore('schedules', schedule);
       addNotification("Đã thêm lịch phát mới", "success");
     }
   };
@@ -243,7 +249,7 @@ export default function App() {
     }
     const updated = schedules.filter(s => s.id !== id);
     setSchedules(updated);
-    saveToStorage('schedules', updated);
+    deleteDocFromFirestore('schedules', id);
   };
 
   const onDrop = (acceptedFiles: File[]) => {
@@ -259,9 +265,9 @@ export default function App() {
         };
         setAudioFiles(prev => {
           const updated = [newFile, ...prev];
-          saveToStorage('audioFiles', updated);
           return updated;
         });
+        saveDocToFirestore('audioFiles', newFile);
         addNotification(`Đã tải lên: ${file.name}`, 'success');
       };
       reader.readAsDataURL(file);
@@ -280,21 +286,58 @@ export default function App() {
   // --- Initialization ---
 
   useEffect(() => {
+    const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
+      setUser(currentUser);
+      setIsAuthReady(true);
+    });
+    return () => unsubscribe();
+  }, []);
+
+  useEffect(() => {
+    if (!isAuthReady || !user) return;
+
+    const audioFilesRef = collection(db, `users/${user.uid}/audioFiles`);
+    const schedulesRef = collection(db, `users/${user.uid}/schedules`);
+    const announcementsRef = collection(db, `users/${user.uid}/announcements`);
+
+    const unsubAudio = onSnapshot(audioFilesRef, (snapshot) => {
+      const files: AudioFile[] = [];
+      snapshot.forEach((doc) => files.push(doc.data() as AudioFile));
+      setAudioFiles(files.sort((a, b) => b.createdAt - a.createdAt));
+    }, (error) => {
+      console.error("Lỗi đồng bộ audioFiles:", error);
+    });
+
+    const unsubSchedules = onSnapshot(schedulesRef, (snapshot) => {
+      const schs: Schedule[] = [];
+      snapshot.forEach((doc) => schs.push(doc.data() as Schedule));
+      setSchedules(schs);
+    }, (error) => {
+      console.error("Lỗi đồng bộ schedules:", error);
+    });
+
+    const unsubAnnouncements = onSnapshot(announcementsRef, (snapshot) => {
+      const anns: Announcement[] = [];
+      snapshot.forEach((doc) => anns.push(doc.data() as Announcement));
+      setAnnouncements(anns.sort((a, b) => b.createdAt - a.createdAt));
+    }, (error) => {
+      console.error("Lỗi đồng bộ announcements:", error);
+    });
+
+    return () => {
+      unsubAudio();
+      unsubSchedules();
+      unsubAnnouncements();
+    };
+  }, [user, isAuthReady]);
+
+  useEffect(() => {
     const timer = setInterval(() => setCurrentTime(new Date()), 1000);
     window.addEventListener('online', () => setIsOnline(true));
     window.addEventListener('offline', () => setIsOnline(false));
 
-    // Load data from LocalStorage
+    // Load settings from LocalStorage
     try {
-      const savedFiles = localStorage.getItem('audioFiles');
-      if (savedFiles) setAudioFiles(JSON.parse(savedFiles));
-
-      const savedSchedules = localStorage.getItem('schedules');
-      if (savedSchedules) setSchedules(JSON.parse(savedSchedules));
-
-      const savedAnnouncements = localStorage.getItem('announcements');
-      if (savedAnnouncements) setAnnouncements(JSON.parse(savedAnnouncements));
-
       const savedSettings = localStorage.getItem('settings');
       if (savedSettings) {
         const settings = JSON.parse(savedSettings);
@@ -303,8 +346,6 @@ export default function App() {
       }
     } catch (e) {
       console.error("Lỗi tải dữ liệu từ LocalStorage:", e);
-      // Optional: clear corrupted storage
-      // localStorage.clear();
     }
 
     // Initialize Socket.io
@@ -514,12 +555,34 @@ export default function App() {
     }, 5000);
   };
 
+  const saveDocToFirestore = async (collectionName: string, item: any) => {
+    if (!user) return;
+    try {
+      await setDoc(doc(db, `users/${user.uid}/${collectionName}`, item.id), {
+        ...item,
+        uid: user.uid
+      });
+    } catch (error) {
+      console.error(`Lỗi lưu ${collectionName}:`, error);
+      addNotification("Không thể đồng bộ dữ liệu.", "error");
+    }
+  };
+
+  const deleteDocFromFirestore = async (collectionName: string, id: string) => {
+    if (!user) return;
+    try {
+      await deleteDoc(doc(db, `users/${user.uid}/${collectionName}`, id));
+    } catch (error) {
+      console.error(`Lỗi xóa ${collectionName}:`, error);
+      addNotification("Không thể xóa dữ liệu đồng bộ.", "error");
+    }
+  };
+
   const saveToStorage = (key: string, data: any) => {
     try {
       localStorage.setItem(key, JSON.stringify(data));
     } catch (e) {
       console.error("Lỗi lưu dữ liệu vào LocalStorage:", e);
-      addNotification("Bộ nhớ trình duyệt đầy, không thể lưu dữ liệu.", "error");
     }
   };
 
@@ -554,9 +617,9 @@ export default function App() {
       
       setAudioFiles(prev => {
         const updated = [newFile, ...prev];
-        saveToStorage('audioFiles', updated);
         return updated;
       });
+      saveDocToFirestore('audioFiles', newFile);
       
       setRemoteUrl('');
       playAudio(newFile);
@@ -864,9 +927,9 @@ export default function App() {
                           };
                           setAudioFiles(prev => {
                             const updated = [newFile, ...prev];
-                            saveToStorage('audioFiles', updated);
                             return updated;
                           });
+                          saveDocToFirestore('audioFiles', newFile);
                           setNewSchedule(prev => ({ ...prev, audioId: newFile.id }));
                           addNotification(`Đã tải lên và chọn: ${file.name}`, 'success');
                         };
@@ -976,7 +1039,7 @@ export default function App() {
         };
         const updated = [newAnn, ...announcements];
         setAnnouncements(updated);
-        saveToStorage('announcements', updated);
+        saveDocToFirestore('announcements', newAnn);
       } catch (e) {
         console.error("Lỗi tạo thông báo AI:", e);
         addNotification("Không thể tạo thông báo AI.", "error");
@@ -1063,7 +1126,7 @@ export default function App() {
                     <Button variant="ghost" size="sm" icon={Trash2} className="text-red-500" onClick={() => {
                       const updated = announcements.filter(item => item.id !== a.id);
                       setAnnouncements(updated);
-                      saveToStorage('announcements', updated);
+                      deleteDocFromFirestore('announcements', a.id);
                     }} />
                   </div>
                 </div>
@@ -1079,7 +1142,7 @@ export default function App() {
     const deleteFile = (id: string) => {
       const updated = audioFiles.filter(f => f.id !== id);
       setAudioFiles(updated);
-      saveToStorage('audioFiles', updated);
+      deleteDocFromFirestore('audioFiles', id);
     };
 
     const filteredFiles = audioFiles.filter(f => f.name.toLowerCase().includes(searchQuery.toLowerCase()));
@@ -1335,6 +1398,44 @@ export default function App() {
     </div>
   );
 
+  if (!isAuthReady) {
+    return (
+      <div className="min-h-screen bg-zinc-50 dark:bg-black flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-zinc-900 dark:border-white"></div>
+      </div>
+    );
+  }
+
+  if (!user) {
+    return (
+      <div className="min-h-screen bg-zinc-50 dark:bg-black flex flex-col items-center justify-center p-4">
+        <div className="w-20 h-20 bg-zinc-900 dark:bg-zinc-100 rounded-2xl flex items-center justify-center mb-8 shadow-xl">
+          <Zap className="text-white dark:text-zinc-900" size={40} />
+        </div>
+        <h1 className="text-4xl font-black mb-2 text-zinc-900 dark:text-white tracking-tight text-center">SMART SCHOOL RADIO AI</h1>
+        <p className="text-zinc-500 dark:text-zinc-400 mb-12 text-center max-w-md">
+          Đăng nhập để đồng bộ lịch phát sóng, âm thanh và thông báo trên tất cả các thiết bị của bạn.
+        </p>
+        <Button 
+          size="lg" 
+          onClick={async () => {
+            try {
+              await signInWithGoogle();
+            } catch (error) {
+              console.error("Login failed", error);
+            }
+          }}
+          className="px-8 py-4 text-lg rounded-2xl shadow-lg hover:scale-105 transition-transform"
+        >
+          Đăng nhập bằng Google
+        </Button>
+        <div className="mt-12 text-sm text-zinc-400 font-medium">
+          Phát triển bởi CHU ĐỨC LỢI
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen bg-zinc-50 dark:bg-black text-zinc-900 dark:text-zinc-100 font-sans transition-colors">
       <audio ref={audioRef} onEnded={() => setIsPlaying(false)} />
@@ -1391,11 +1492,18 @@ export default function App() {
         <div className="p-4">
           <Button 
             variant="danger" 
-            className={cn("w-full transition-all", isEmergency ? "animate-pulse" : "")} 
+            className={cn("w-full transition-all mb-4", isEmergency ? "animate-pulse" : "")} 
             icon={AlertCircle}
             onClick={triggerEmergency}
           >
             <span className="hidden lg:inline">KHẨN CẤP</span>
+          </Button>
+          <Button 
+            variant="outline" 
+            className="w-full text-xs" 
+            onClick={() => logOut()}
+          >
+            <span className="hidden lg:inline">Đăng xuất</span>
           </Button>
           <div className="hidden lg:block text-center mt-4 text-xs text-zinc-400 font-medium">
             Phát triển bởi CHU ĐỨC LỢI

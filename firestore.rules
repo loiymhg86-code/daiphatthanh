@@ -1,0 +1,147 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users/{userId}/audioFiles
+    // Document ID: {audioFileId}
+    // Fields:
+    //   - id: string (required)
+    //   - name: string (required)
+    //   - url: string (required)
+    //   - type: string (required, 'local' | 'remote' | 'tts')
+    //   - duration: number (optional)
+    //   - createdAt: number (required)
+    //   - uid: string (required)
+    //
+    // Collection: users/{userId}/schedules
+    // Document ID: {scheduleId}
+    // Fields:
+    //   - id: string (required)
+    //   - time: string (required)
+    //   - audioId: string (required)
+    //   - label: string (required)
+    //   - days: list of numbers (required)
+    //   - enabled: boolean (required)
+    //   - section: string (required, 'morning' | 'afternoon')
+    //   - uid: string (required)
+    //
+    // Collection: users/{userId}/announcements
+    // Document ID: {announcementId}
+    // Fields:
+    //   - id: string (required)
+    //   - text: string (required)
+    //   - voice: string (required)
+    //   - speed: number (required)
+    //   - pitch: number (required)
+    //   - createdAt: number (required)
+    //   - uid: string (required)
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+    
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.uid;
+    }
+    
+    function uidUnchanged() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == request.auth.uid;
+    }
+    
+    function uidNotModified() {
+      return !('uid' in request.resource.data) || request.resource.data.uid == resource.data.uid;
+    }
+    
+    function hasRequiredFields(fields) {
+      return request.resource.data.keys().hasAll(fields);
+    }
+    
+    function hasOnlyAllowedFields(fields) {
+      return request.resource.data.keys().hasOnly(fields);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidAudioFile() {
+      let data = request.resource.data;
+      return hasRequiredFields(['id', 'name', 'url', 'type', 'createdAt', 'uid']) &&
+             data.id is string && data.id.size() > 0 && data.id.size() < 100 &&
+             data.name is string && data.name.size() > 0 && data.name.size() < 200 &&
+             data.url is string && data.url.size() > 0 && data.url.size() < 1500000 && // allow base64 up to ~1.5MB
+             data.type in ['local', 'remote', 'tts'] &&
+             (!('duration' in data) || data.duration is number) &&
+             data.createdAt is number &&
+             data.uid is string && data.uid == request.auth.uid;
+    }
+
+    function isValidSchedule() {
+      let data = request.resource.data;
+      return hasRequiredFields(['id', 'time', 'audioId', 'label', 'days', 'enabled', 'section', 'uid']) &&
+             data.id is string && data.id.size() > 0 && data.id.size() < 100 &&
+             data.time is string && data.time.size() == 5 &&
+             data.audioId is string && data.audioId.size() > 0 && data.audioId.size() < 100 &&
+             data.label is string && data.label.size() > 0 && data.label.size() < 200 &&
+             data.days is list && data.days.size() <= 7 &&
+             data.enabled is bool &&
+             data.section in ['morning', 'afternoon'] &&
+             data.uid is string && data.uid == request.auth.uid;
+    }
+
+    function isValidAnnouncement() {
+      let data = request.resource.data;
+      return hasRequiredFields(['id', 'text', 'voice', 'speed', 'pitch', 'createdAt', 'uid']) &&
+             data.id is string && data.id.size() > 0 && data.id.size() < 100 &&
+             data.text is string && data.text.size() > 0 && data.text.size() < 5000 &&
+             data.voice is string && data.voice.size() > 0 && data.voice.size() < 50 &&
+             data.speed is number && data.speed >= 0.1 && data.speed <= 5.0 &&
+             data.pitch is number && data.pitch >= 0.1 && data.pitch <= 5.0 &&
+             data.createdAt is number &&
+             data.uid is string && data.uid == request.auth.uid;
+    }
+
+    // ===============================================================
+    // Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isOwner(userId);
+      
+      match /audioFiles/{audioFileId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidAudioFile() && uidUnchanged();
+        allow update: if isOwner(userId) && isDocOwner() && isValidAudioFile() && uidNotModified();
+        allow delete: if isOwner(userId) && isDocOwner();
+      }
+
+      match /schedules/{scheduleId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidSchedule() && uidUnchanged();
+        allow update: if isOwner(userId) && isDocOwner() && isValidSchedule() && uidNotModified();
+        allow delete: if isOwner(userId) && isDocOwner();
+      }
+
+      match /announcements/{announcementId} {
+        allow read: if isOwner(userId);
+        allow create: if isOwner(userId) && isValidAnnouncement() && uidUnchanged();
+        allow update: if isOwner(userId) && isDocOwner() && isValidAnnouncement() && uidNotModified();
+        allow delete: if isOwner(userId) && isDocOwner();
+      }
+    }
+  }
+}
